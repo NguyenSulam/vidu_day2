@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -17,6 +18,36 @@ REL_NS = {"pr": "http://schemas.openxmlformats.org/package/2006/relationships"}
 EXCEL_EPOCH = datetime(1899, 12, 30)
 EMPTY_VALUE = "[trống]"
 OUTPUT_HEADERS = ["STT", "Ngày", "Tên phân xưởng", "Nội dung"]
+
+
+def setup_logging(log_dir: Path = Path("logs")) -> logging.Logger:
+    """Cấu hình logging để ghi vào file và console."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    
+    # File handler
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    
+    # Formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
 
 
 @dataclass(frozen=True)
@@ -187,31 +218,41 @@ def extract_workshop(path: Path) -> tuple[str, int]:
 
 
 def read_step1(data_dir: Path) -> list[RawReport]:
+    logger = logging.getLogger(__name__)
     reports: list[RawReport] = []
     files = sorted(path for path in data_dir.glob("*.xlsx") if not path.name.startswith("~$"))
+    logger.info(f"Bắt đầu đọc {len(files)} file từ thư mục {data_dir}")
 
     for path in files:
-        rows = read_xlsx_rows(path)
-        workshop, workshop_order = extract_workshop(path)
+        try:
+            rows = read_xlsx_rows(path)
+            workshop, workshop_order = extract_workshop(path)
+            logger.debug(f"Đọc file {path.name}: {workshop} ({len(rows)} dòng)")
 
-        for row_number, row in enumerate(rows[1:], start=2):
-            row = row + [""] * (5 - len(row))
-            try:
-                reports.append(
-                    RawReport(
-                        source_file=path.name,
-                        workshop=workshop,
-                        workshop_order=workshop_order,
-                        source_stt=row[0],
-                        work_date=parse_excel_date(row[1]),
-                        start_time=parse_excel_time(row[2]),
-                        shift_lead=row[3],
-                        content=row[4],
+            for row_number, row in enumerate(rows[1:], start=2):
+                row = row + [""] * (5 - len(row))
+                try:
+                    reports.append(
+                        RawReport(
+                            source_file=path.name,
+                            workshop=workshop,
+                            workshop_order=workshop_order,
+                            source_stt=row[0],
+                            work_date=parse_excel_date(row[1]),
+                            start_time=parse_excel_time(row[2]),
+                            shift_lead=row[3],
+                            content=row[4],
+                        )
                     )
-                )
-            except ValueError as exc:
-                raise ValueError(f"{path.name}, dòng Excel {row_number}: {exc}") from exc
+                except ValueError as exc:
+                    error_msg = f"{path.name}, dòng Excel {row_number}: {exc}"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg) from exc
+        except Exception as exc:
+            logger.error(f"Lỗi đọc file {path.name}: {exc}")
+            raise
 
+    logger.info(f"Hoàn thành đọc dữ liệu: {len(reports)} dòng từ {len(files)} file")
     return reports
 
 
@@ -343,30 +384,53 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    logger = setup_logging()
+    logger.info("=" * 60)
+    logger.info("Bắt đầu chương trình tổng hợp báo cáo")
+    logger.info("=" * 60)
+    
     args = parse_args()
     data_dir = args.data_dir
     output_path = args.output_file or default_output_path(args.output_dir)
+    
+    logger.info(f"Thư mục đầu vào: {data_dir}")
+    logger.info(f"File đầu ra: {output_path}")
 
     if not data_dir.exists():
-        print(f"Không tìm thấy thư mục dữ liệu: {data_dir}", file=sys.stderr)
+        error_msg = f"Không tìm thấy thư mục dữ liệu: {data_dir}"
+        logger.error(error_msg)
+        print(error_msg, file=sys.stderr)
         return 1
 
     try:
         raw_reports = read_step1(data_dir)
         daily_reports = summarize_step2(raw_reports)
+        logger.info(f"Tổng hợp thành {len(daily_reports)} báo cáo hàng ngày")
+        
         output_rows = build_excel_rows_step3(daily_reports)
         write_xlsx(output_path, output_rows)
+        logger.info(f"Ghi file Excel thành công: {output_path}")
     except Exception as exc:
-        print(f"Lỗi: {exc}", file=sys.stderr)
+        error_msg = f"Lỗi: {exc}"
+        logger.exception(error_msg)
+        print(error_msg, file=sys.stderr)
         return 1
 
     blank_rows = sum(
         1 for item in daily_reports if not item.shift_lead.strip() or not item.content.strip()
     )
+    logger.info(f"Đã đọc {len(raw_reports)} dòng dữ liệu từ {data_dir}.")
+    logger.info(f"Đã tạo {len(output_rows) - 1} dòng báo cáo tổng hợp.")
+    logger.info(f"Số dòng có Trưởng ca hoặc Nội dung trống: {blank_rows}.")
+    
     print(f"Đã đọc {len(raw_reports)} dòng dữ liệu từ {data_dir}.")
     print(f"Đã tạo {len(output_rows) - 1} dòng báo cáo tổng hợp.")
     print(f"Số dòng có Trưởng ca hoặc Nội dung trống: {blank_rows}.")
     print(f"File đầu ra: {output_path}")
+    
+    logger.info("=" * 60)
+    logger.info("Chương trình hoàn thành thành công")
+    logger.info("=" * 60)
     return 0
 
 
